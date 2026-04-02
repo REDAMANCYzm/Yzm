@@ -1,0 +1,10 @@
+# Directories
+img/
+data/
+model/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Dataset files
+run_translation/*.jsonl
