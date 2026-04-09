@@ -180,7 +180,6 @@ def _value_fn_impl(smi, text_embedding_tensor):
 
 def get_beam(products, beam_size):
     ins = "Please predict the reactant of the product:\n"
-    final_beams = []
     inputs = reactant_tokenizer(
         ins + products[-1],
         return_tensors='pt',
@@ -197,7 +196,12 @@ def get_beam(products, beam_size):
             return_dict_in_generate=True
         )
 
-    for tok, score,i in zip(outputs["sequences"], outputs["sequences_scores"],range(len(outputs["sequences"]))):
+    return decode_beam_outputs(outputs["sequences"], outputs["sequences_scores"], beam_size)
+
+
+def decode_beam_outputs(sequences, sequence_scores, beam_size):
+    final_beams = []
+    for tok, score, i in zip(sequences, sequence_scores, range(len(sequences))):
         generated_text = reactant_tokenizer.decode(tok, skip_special_tokens=True, clean_up_tokenization_spaces=True)
         final_beams.append([generated_text, -score])
 
@@ -222,6 +226,42 @@ def get_beam(products, beam_size):
             aim_size -= 1
 
     return answer
+
+
+def get_beam_batch(product_smiles_list, beam_size):
+    if not product_smiles_list:
+        return {}
+
+    prompts = [f"Please predict the reactant of the product:\n{product_smiles}" for product_smiles in product_smiles_list]
+    inputs = reactant_tokenizer(
+        prompts,
+        return_tensors='pt',
+        truncation=True,
+        padding=True
+    ).to(device)
+
+    with torch.no_grad():
+        outputs = reactant_model.generate(
+            inputs['input_ids'],
+            attention_mask=inputs['attention_mask'],
+            num_beams=beam_size,
+            max_new_tokens=256,
+            num_return_sequences=beam_size,
+            output_scores=True,
+            return_dict_in_generate=True
+        )
+
+    batched_answers = {}
+    for index, product_smiles in enumerate(product_smiles_list):
+        start = index * beam_size
+        end = start + beam_size
+        batched_answers[product_smiles] = decode_beam_outputs(
+            outputs["sequences"][start:end],
+            outputs["sequences_scores"][start:end],
+            beam_size
+        )
+
+    return batched_answers
 
 def get_arguments():
     args = parse_arguments()
@@ -346,9 +386,36 @@ def get_route_result(task):
         "routes_info": [{"route": [task["product"]], "depth": 0}],  # List of routes information
         "starting_materials": [],
     })
+
+    def populate_beam_cache_for_queue(queue_items):
+        uncached_expansion_mols = []
+        seen_expansion_mols = set()
+        for queue_item in queue_items:
+            routes_info = queue_item["routes_info"]
+            if not routes_info:
+                continue
+            first_route_info = routes_info[0]
+            depth = first_route_info["depth"]
+            if depth > max_depth:
+                continue
+            expansion_mol = first_route_info["route"][-1]
+            if expansion_mol in beam_cache or expansion_mol in seen_expansion_mols:
+                continue
+            uncached_expansion_mols.append(expansion_mol)
+            seen_expansion_mols.add(expansion_mol)
+
+        if not uncached_expansion_mols:
+            return
+
+        batch_size = max(1, args.beam_batch_size)
+        for start in range(0, len(uncached_expansion_mols), batch_size):
+            batch_products = uncached_expansion_mols[start:start + batch_size]
+            beam_cache.update(get_beam_batch(batch_products, args.beam_size))
+
     while True:
         if len(queue) == 0:
             break
+        populate_beam_cache_for_queue(queue)
         nxt_queue = []
         for item in queue:
             score = item["score"]
@@ -602,6 +669,8 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=42, help='Random seed.')
     parser.add_argument('--beam_size', type=int, default=5,
                         help='Beams size. Default 5. Must be 1 meaning greedy search or greater or equal 5.')
+    parser.add_argument('--beam_batch_size', type=int, default=1,
+                        help='Number of frontier molecules to batch together for MolT5 generation. Default 1 keeps the original behavior.')
     parser.add_argument('--limit', type=int, default=None,
                         help='Only evaluate the first N test samples.')
     parser.add_argument('--random_limit', type=int, default=None,
