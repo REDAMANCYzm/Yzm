@@ -1,6 +1,7 @@
 import random
 import json
 import logging
+from collections import Counter, defaultdict
 import pandas as pd
 import torch
 from rdkit.Chem import AllChem
@@ -12,7 +13,7 @@ import argparse
 import os
 from model.Molecule_representation.datasets.bace_geomol_feat import featurize_mol_from_smiles
 from icecream import install
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+#os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 import seaborn
 
@@ -443,6 +444,66 @@ def text_embedding(text):
         embedding = text_model(token_text['input_ids'],attention_mask = token_text['attention_mask'])['pooler_output']
     return embedding
 
+
+def summarize_depth_distribution(tasks):
+    depth_counts = Counter(task["depth"] for task in tasks)
+    summary = ", ".join(f"depth {depth}: {count}" for depth, count in sorted(depth_counts.items()))
+    return summary if summary else "empty"
+
+
+def stratified_sample_tasks(tasks, sample_size, sample_seed):
+    if sample_size >= len(tasks):
+        return list(tasks)
+
+    grouped_tasks = defaultdict(list)
+    for task in tasks:
+        grouped_tasks[task["depth"]].append(task)
+
+    rng = random.Random(sample_seed)
+    total_tasks = len(tasks)
+    allocations = {}
+    remainders = []
+
+    for depth, depth_tasks in grouped_tasks.items():
+        exact_quota = sample_size * len(depth_tasks) / total_tasks
+        base_quota = min(len(depth_tasks), int(exact_quota))
+        allocations[depth] = base_quota
+        remainders.append((exact_quota - base_quota, depth))
+
+    if sample_size >= len(grouped_tasks):
+        for depth, depth_tasks in grouped_tasks.items():
+            if allocations[depth] == 0 and len(depth_tasks) > 0:
+                allocations[depth] = 1
+
+    allocated = sum(allocations.values())
+    if allocated > sample_size:
+        for _, depth in sorted(remainders):
+            if allocated == sample_size:
+                break
+            if allocations[depth] > 1:
+                allocations[depth] -= 1
+                allocated -= 1
+
+    remaining = sample_size - allocated
+    for _, depth in sorted(remainders, reverse=True):
+        if remaining == 0:
+            break
+        capacity = len(grouped_tasks[depth]) - allocations[depth]
+        if capacity <= 0:
+            continue
+        take = min(capacity, remaining)
+        allocations[depth] += take
+        remaining -= take
+
+    sampled_tasks = []
+    for depth in sorted(grouped_tasks):
+        depth_tasks = list(grouped_tasks[depth])
+        rng.shuffle(depth_tasks)
+        sampled_tasks.extend(depth_tasks[:allocations[depth]])
+
+    rng.shuffle(sampled_tasks)
+    return sampled_tasks
+
 def parse_arguments():
     p = argparse.ArgumentParser()
 
@@ -545,8 +606,10 @@ if __name__ == "__main__":
                         help='Only evaluate the first N test samples.')
     parser.add_argument('--random_limit', type=int, default=None,
                         help='Randomly evaluate N test samples.')
+    parser.add_argument('--stratified_limit', type=int, default=None,
+                        help='Stratified sample N test samples while preserving depth coverage.')
     parser.add_argument('--sample_seed', type=int, default=None,
-                        help='Random seed used for random test sampling. Defaults to --seed.')
+                        help='Random seed used for sampled test subsets. Defaults to --seed.')
     parser.add_argument('--pretrain_checkpoint', type=str, default='model/value_function_fusion-model.pkl')
     parser.add_argument('--dropout', type=float, default=0.1)
 
@@ -590,7 +653,17 @@ if __name__ == "__main__":
     stock_inchikeys = set([x[:14] for x in stockinchikey_list])
 
     tasks = load_dataset('test')
-    if args.random_limit is not None:
+    sampling_args = [args.limit is not None, args.random_limit is not None, args.stratified_limit is not None]
+    if sum(sampling_args) > 1:
+        raise ValueError("Only one of --limit, --random_limit, or --stratified_limit can be specified.")
+
+    if args.stratified_limit is not None:
+        sample_size = min(args.stratified_limit, len(tasks))
+        sample_seed = args.seed if args.sample_seed is None else args.sample_seed
+        tasks = stratified_sample_tasks(tasks, sample_size, sample_seed)
+        print(f"Stratified sampled {sample_size} test samples with seed {sample_seed}.", flush=True)
+        print(f"Sample depth distribution: {summarize_depth_distribution(tasks)}", flush=True)
+    elif args.random_limit is not None:
         sample_size = min(args.random_limit, len(tasks))
         sample_seed = args.seed if args.sample_seed is None else args.sample_seed
         sampler = random.Random(sample_seed)
