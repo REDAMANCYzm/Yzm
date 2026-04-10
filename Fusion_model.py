@@ -1,6 +1,7 @@
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 import json
+from collections import defaultdict
 from rdkit import Chem
 from rdkit.Chem.rdchem import BondType as BT
 from rdkit.Chem.rdchem import ChiralType
@@ -22,6 +23,11 @@ from model.Molecule_representation.models import *
 from model.Molecule_representation.datasets.samplers import *
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FUSION_CHECKPOINT_PATH = os.path.join(
+    BASE_DIR,
+    'model',
+    'value_function_text_conditioned_fusion-model_val.pkl'
+)
 
 bonds = {BT.SINGLE: 0, BT.DOUBLE: 1, BT.TRIPLE: 2, BT.AROMATIC: 3}
 types = {'H': 0, 'Li': 1, 'B': 2, 'C': 3, 'N': 4, 'O': 5, 'F': 6, 'Na': 7, 'Mg': 8, 'Al': 9, 'Si': 10,
@@ -152,7 +158,8 @@ class MyDataset(Dataset):
                 temp = to_dgl(g)
                 temp.edata['feat'] = g.edge_attr.long()
                 temp.ndata['feat'] = g.z.long()
-                v = self.value_model(temp).to(self.device)
+                with torch.no_grad():
+                    v = self.value_model(temp).to(self.device)
                 represent.append(v)
             t = represent[0]
             for ind in range(1, len(represent)):
@@ -163,20 +170,85 @@ class MyDataset(Dataset):
             temp = to_dgl(g)
             temp.edata['feat'] = g.edge_attr.long()
             temp.ndata['feat'] = g.z.long()
-            v = self.value_model(temp).to(self.device)
+            with torch.no_grad():
+                v = self.value_model(temp).to(self.device)
             return v
 
     def text_embedding(self, text):
-        token_text = self.tokenizer(text, max_length=512, return_tensors='pt').to(self.device)
-        embedding = self.text_model(token_text['input_ids'], attention_mask=token_text['attention_mask'])['pooler_output']
+        token_text = self.tokenizer(text, max_length=512, truncation=True, return_tensors='pt').to(self.device)
+        with torch.no_grad():
+            embedding = self.text_model(
+                token_text['input_ids'],
+                attention_mask=token_text['attention_mask']
+            )['pooler_output']
         return embedding
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
-        molecule_representation = torch.tensor(self.represent(item['product']),dtype=torch.float32)
-        text_embedding = torch.tensor(self.text_embedding(item['text']),dtype=torch.float32)
+        molecule_representation = self.represent(item['product']).clone().detach().float()
+        text_embedding = self.text_embedding(item['text']).clone().detach().float()
         cost = torch.tensor(item['cost'], dtype=torch.float32)
         return molecule_representation, text_embedding, cost
+
+
+def build_stratified_train_val_subsets(dataset, val_ratio, seed):
+    if val_ratio <= 0:
+        indices = list(range(len(dataset)))
+        return Subset(dataset, indices), None, indices, []
+
+    grouped_indices = defaultdict(list)
+    for index, item in enumerate(dataset.dataset):
+        grouped_indices[item.get('depth', 0)].append(index)
+
+    rng = np.random.default_rng(seed)
+    train_indices = []
+    val_indices = []
+
+    for depth in sorted(grouped_indices):
+        depth_indices = list(grouped_indices[depth])
+        rng.shuffle(depth_indices)
+
+        if len(depth_indices) <= 1:
+            train_indices.extend(depth_indices)
+            continue
+
+        proposed_val_size = int(round(len(depth_indices) * val_ratio))
+        val_size = max(1, proposed_val_size)
+        val_size = min(len(depth_indices) - 1, val_size)
+
+        val_indices.extend(depth_indices[:val_size])
+        train_indices.extend(depth_indices[val_size:])
+
+    rng.shuffle(train_indices)
+    rng.shuffle(val_indices)
+
+    return Subset(dataset, train_indices), Subset(dataset, val_indices), train_indices, val_indices
+
+
+def evaluate_model(fusion_model, dataloader, criterion, device):
+    fusion_model.eval()
+    total_loss = 0.0
+    total_mae = 0.0
+    total_samples = 0
+
+    with torch.no_grad():
+        for molecule_embeddings, text_embeddings, costs in dataloader:
+            molecule_embeddings = molecule_embeddings.to(device)
+            text_embeddings = text_embeddings.to(device)
+            costs = costs.to(device)
+
+            outputs = fusion_model(molecule_embeddings, text_embeddings)
+            costs = costs.view_as(outputs)
+            batch_size = costs.size(0)
+
+            total_loss += criterion(outputs, costs).item() * batch_size
+            total_mae += torch.abs(outputs - costs).sum().item()
+            total_samples += batch_size
+
+    if total_samples == 0:
+        return None, None
+
+    return total_loss / total_samples, total_mae / total_samples
 
 class ValueMLP(nn.Module):
     def __init__(self, n_layers, fp_dim, latent_dim, dropout_rate):
@@ -211,39 +283,86 @@ class ValueMLP(nn.Module):
 
         return x
 
-class AttentionFusionModel(nn.Module):
-    def __init__(self, d_molecule, d_text, d_model):
+class TextConditionedFusionModel(nn.Module):
+    def __init__(self, d_molecule, d_text, d_model, dropout_rate):
 
-        super(AttentionFusionModel, self).__init__()
+        super(TextConditionedFusionModel, self).__init__()
         self.d_molecule = d_molecule
         self.d_text = d_text
         self.d_model = d_model
-        self.scale = torch.sqrt(torch.tensor(self.d_model, dtype=torch.float32))
 
-        self.W_Q = nn.Linear(d_text, d_model)
-        self.W_K = nn.Linear(d_text, d_model)
-        self.W_V = nn.Linear(d_molecule, d_model)
+        self.molecule_proj = nn.Sequential(
+            nn.Linear(d_molecule, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU()
+        )
+        self.text_proj = nn.Sequential(
+            nn.Linear(d_text, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU()
+        )
+        self.gamma = nn.Linear(d_model, d_model)
+        self.beta = nn.Linear(d_model, d_model)
+        self.gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Sigmoid()
+        )
+        self.output_proj = nn.Sequential(
+            nn.Linear(d_model * 5, d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(d_model, d_model)
+        )
+
+    def _prepare_inputs(self, molecule_embedding, text_embedding):
+        if molecule_embedding.dim() == 1:
+            molecule_embedding = molecule_embedding.unsqueeze(0)
+        if text_embedding.dim() == 1:
+            text_embedding = text_embedding.unsqueeze(0)
+
+        if molecule_embedding.dim() == 3 and molecule_embedding.size(1) == 1:
+            molecule_embedding = molecule_embedding.squeeze(1)
+        if text_embedding.dim() == 3 and text_embedding.size(1) == 1:
+            text_embedding = text_embedding.squeeze(1)
+
+        if text_embedding.size(0) == 1 and molecule_embedding.size(0) > 1:
+            text_embedding = text_embedding.expand(molecule_embedding.size(0), -1)
+        elif molecule_embedding.size(0) != text_embedding.size(0):
+            raise ValueError(
+                f"Expected molecule and text batches to align, got {molecule_embedding.shape} and {text_embedding.shape}"
+            )
+
+        return molecule_embedding, text_embedding
+
     def forward(self, molecule_embedding, text_embedding):
+        molecule_embedding, text_embedding = self._prepare_inputs(molecule_embedding, text_embedding)
 
-        Q = self.W_Q(text_embedding)
-        K = self.W_K(text_embedding)
-        V = self.W_V(molecule_embedding)
+        molecule_feature = self.molecule_proj(molecule_embedding)
+        text_feature = self.text_proj(text_embedding)
 
-        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        gamma = torch.tanh(self.gamma(text_feature))
+        beta = self.beta(text_feature)
+        modulated_molecule = molecule_feature * (1 + gamma) + beta
 
-        attention_weights = F.softmax(attention_scores, dim=-1)
+        gate = self.gate(torch.cat([molecule_feature, text_feature], dim=-1))
+        fused_core = gate * modulated_molecule + (1 - gate) * molecule_feature
 
-        output = torch.matmul(attention_weights, V)
-        return output
+        interaction_feature = molecule_feature * text_feature
+        difference_feature = torch.abs(molecule_feature - text_feature)
+        fusion_feature = torch.cat(
+            [molecule_feature, fused_core, text_feature, interaction_feature, difference_feature],
+            dim=-1
+        )
+        return self.output_proj(fusion_feature)
 
 class FusionModel(nn.Module):
     def __init__(self, d_molecule, d_text, d_model, n_layers, latent_dim, dropout_rate):
         super(FusionModel, self).__init__()
-        self.attention_fusion = AttentionFusionModel(d_molecule, d_text, d_model)
+        self.text_conditioned_fusion = TextConditionedFusionModel(d_molecule, d_text, d_model, dropout_rate)
         self.value_mlp = ValueMLP(n_layers, d_model, latent_dim, dropout_rate)
 
     def forward(self, molecule_embedding, text_embedding):
-        fused_output = self.attention_fusion(molecule_embedding, text_embedding)
+        fused_output = self.text_conditioned_fusion(molecule_embedding, text_embedding)
         value_output = self.value_mlp(fused_output)
         return value_output
 
@@ -360,7 +479,8 @@ def parse_arguments():
     p.add_argument('--force_random_split', type=bool, default=False, help='use random split for ogb')
     p.add_argument('--reuse_pre_train_data', type=bool, default=False, help='use all data instead of ignoring that used during pre-training')
     p.add_argument('--transfer_3d', type=bool, default=False, help='set true to load the 3d network instead of the 2d network')
-    return p.parse_args()
+    args, _ = p.parse_known_args()
+    return args
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -375,15 +495,20 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--val_ratio', type=float, default=0.1)
+    parser.add_argument('--val_seed', type=int, default=42)
     # parser.add_argument('--pretrain_checkpoint', type=str, default='value_function_fusion-model.pkl')
 
 
     args = parser.parse_args()
+    if not 0 <= args.val_ratio < 1:
+        raise ValueError(f"--val_ratio must be in [0, 1), got {args.val_ratio}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     tokenizer = AutoTokenizer.from_pretrained(os.path.join(BASE_DIR, 'model', 'scibert'))
     text_model = AutoModel.from_pretrained(os.path.join(BASE_DIR, 'model', 'scibert'))
     text_model.to(device)
+    text_model.eval()
 
     args_value = get_arguments()
     checkpoint = torch.load(os.path.join(BASE_DIR, "model", "Molecule_representation", "runs", "PNA_qmugs_NTXentMultiplePositives_620000_123_25-08_09-19-52", "best_checkpoint_35epochs.pt"),
@@ -391,10 +516,25 @@ if __name__ == '__main__':
     value_model = globals()[args_value.model_type](node_dim=74, edge_dim=4,
                                                    **args_value.model_parameters)
     value_model.load_state_dict(checkpoint['model_state_dict'])
+    value_model.eval()
 
     file_name = os.path.join(BASE_DIR, "data", "fusion-model_traindataset.json")
     dataset = MyDataset(file_name, tokenizer, text_model, value_model, device)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    train_dataset, val_dataset, train_indices, val_indices = build_stratified_train_val_subsets(
+        dataset,
+        args.val_ratio,
+        args.val_seed
+    )
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_dataloader = None
+    if val_dataset is not None and len(val_indices) > 0:
+        val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+
+    print(f"Total samples: {len(dataset)}")
+    print(f"Train samples: {len(train_indices)}")
+    print(f"Validation samples: {len(val_indices)}")
+    print(f"Validation ratio: {args.val_ratio}")
+    print(f"Validation split seed: {args.val_seed}")
 
     fusion_model = FusionModel(600, 768, 600, args.n_layers, args.latent_dim, args.dropout)
     # fusion_model.load_state_dict(torch.load(args.pretrain_checkpoint))
@@ -402,11 +542,13 @@ if __name__ == '__main__':
     criterion = nn.MSELoss()
     optimizer = optim.Adam(fusion_model.parameters(), lr=args.lr)
 
-    best_loss = float('inf')
+    best_metric = float('inf')
     for epoch in range(args.n_epochs):
         fusion_model.train()
         running_loss = 0.0
-        for batch in tqdm(dataloader):
+        running_mae = 0.0
+        seen_samples = 0
+        for batch in tqdm(train_dataloader):
             molecule_embeddings, text_embeddings, costs = batch
             molecule_embeddings = molecule_embeddings.to(device)
             text_embeddings = text_embeddings.to(device)
@@ -414,15 +556,38 @@ if __name__ == '__main__':
 
             optimizer.zero_grad()
             outputs = fusion_model(molecule_embeddings, text_embeddings)
+            costs = costs.view_as(outputs)
             loss = criterion(outputs, costs)
             loss.backward()
             optimizer.step()
 
-            running_loss += loss.item()
+            batch_size = costs.size(0)
+            running_loss += loss.item() * batch_size
+            running_mae += torch.abs(outputs.detach() - costs).sum().item()
+            seen_samples += batch_size
 
-        epoch_loss = running_loss / len(dataloader)
-        print(f"\nEpoch [{epoch + 1}/{args.n_epochs}], Loss: {epoch_loss:.4f}")
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-            torch.save(fusion_model.state_dict(), os.path.join(BASE_DIR, 'model', 'value_function_fusion-model.pkl'))
-            print(f"Best model saved with loss: {best_loss:.4f}")
+        epoch_loss = running_loss / seen_samples
+        epoch_mae = running_mae / seen_samples
+
+        if val_dataloader is not None:
+            val_loss, val_mae = evaluate_model(fusion_model, val_dataloader, criterion, device)
+            print(
+                f"\nEpoch [{epoch + 1}/{args.n_epochs}], "
+                f"Train Loss: {epoch_loss:.4f}, Train MAE: {epoch_mae:.4f}, "
+                f"Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}"
+            )
+            current_metric = val_loss
+        else:
+            print(
+                f"\nEpoch [{epoch + 1}/{args.n_epochs}], "
+                f"Train Loss: {epoch_loss:.4f}, Train MAE: {epoch_mae:.4f}"
+            )
+            current_metric = epoch_loss
+
+        if current_metric < best_metric:
+            best_metric = current_metric
+            torch.save(fusion_model.state_dict(), FUSION_CHECKPOINT_PATH)
+            if val_dataloader is not None:
+                print(f"Best model saved with validation loss: {best_metric:.4f}")
+            else:
+                print(f"Best model saved with training loss: {best_metric:.4f}")

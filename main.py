@@ -37,6 +37,7 @@ DisableLog('rdApp.warning')
 DisableLog('rdApp.error')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FUSION_CHECKPOINT_PATH = os.path.join(BASE_DIR, 'model', 'value_function_text_conditioned_fusion-model_val.pkl')
 reactant_tokenizer = None
 reactant_model = None
 
@@ -69,44 +70,86 @@ class ValueMLP(nn.Module):
 
         return x
 
-class AttentionFusionModel(nn.Module):
-    def __init__(self, d_molecule, d_text, d_model):
+class TextConditionedFusionModel(nn.Module):
+    def __init__(self, d_molecule, d_text, d_model, dropout_rate):
 
-        super(AttentionFusionModel, self).__init__()
+        super(TextConditionedFusionModel, self).__init__()
         self.d_molecule = d_molecule
         self.d_text = d_text
         self.d_model = d_model
-        self.scale = torch.sqrt(torch.tensor(self.d_model, dtype=torch.float32))
 
-        self.W_Q = nn.Linear(d_text, d_model)
-        self.W_K = nn.Linear(d_text, d_model)
-        self.W_V = nn.Linear(d_molecule, d_model)
+        self.molecule_proj = nn.Sequential(
+            nn.Linear(d_molecule, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU()
+        )
+        self.text_proj = nn.Sequential(
+            nn.Linear(d_text, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU()
+        )
+        self.gamma = nn.Linear(d_model, d_model)
+        self.beta = nn.Linear(d_model, d_model)
+        self.gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Sigmoid()
+        )
+        self.output_proj = nn.Sequential(
+            nn.Linear(d_model * 5, d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(d_model, d_model)
+        )
+
+    def _prepare_inputs(self, molecule_embedding, text_embedding):
+        if molecule_embedding.dim() == 1:
+            molecule_embedding = molecule_embedding.unsqueeze(0)
+        if text_embedding.dim() == 1:
+            text_embedding = text_embedding.unsqueeze(0)
+
+        if molecule_embedding.dim() == 3 and molecule_embedding.size(1) == 1:
+            molecule_embedding = molecule_embedding.squeeze(1)
+        if text_embedding.dim() == 3 and text_embedding.size(1) == 1:
+            text_embedding = text_embedding.squeeze(1)
+
+        if text_embedding.size(0) == 1 and molecule_embedding.size(0) > 1:
+            text_embedding = text_embedding.expand(molecule_embedding.size(0), -1)
+        elif molecule_embedding.size(0) != text_embedding.size(0):
+            raise ValueError(
+                f"Expected molecule and text batches to align, got {molecule_embedding.shape} and {text_embedding.shape}"
+            )
+
+        return molecule_embedding, text_embedding
+
     def forward(self, molecule_embedding, text_embedding):
+        molecule_embedding, text_embedding = self._prepare_inputs(molecule_embedding, text_embedding)
 
-        Q = self.W_Q(text_embedding)
-        K = self.W_K(text_embedding)
-        V = self.W_V(molecule_embedding)
+        molecule_feature = self.molecule_proj(molecule_embedding)
+        text_feature = self.text_proj(text_embedding)
 
-        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        gamma = torch.tanh(self.gamma(text_feature))
+        beta = self.beta(text_feature)
+        modulated_molecule = molecule_feature * (1 + gamma) + beta
 
-        attention_weights = F.softmax(attention_scores, dim=-1)
-        try:
-            output = torch.matmul(attention_weights, V)
-            return output
-        except:
-            output = torch.matmul(attention_weights, V[0].unsqueeze(0))
-            for i in range(1, V.shape[0]):
-                output = torch.concat((output, torch.matmul(attention_weights, V[i].unsqueeze(0))), 0)
-            return output
+        gate = self.gate(torch.cat([molecule_feature, text_feature], dim=-1))
+        fused_core = gate * modulated_molecule + (1 - gate) * molecule_feature
+
+        interaction_feature = molecule_feature * text_feature
+        difference_feature = torch.abs(molecule_feature - text_feature)
+        fusion_feature = torch.cat(
+            [molecule_feature, fused_core, text_feature, interaction_feature, difference_feature],
+            dim=-1
+        )
+        return self.output_proj(fusion_feature)
 
 class FusionModel(nn.Module):
     def __init__(self, d_molecule, d_text, d_model, n_layers, latent_dim, dropout_rate):
         super(FusionModel, self).__init__()
-        self.attention_fusion = AttentionFusionModel(d_molecule, d_text, d_model)
+        self.text_conditioned_fusion = TextConditionedFusionModel(d_molecule, d_text, d_model, dropout_rate)
         self.value_mlp = ValueMLP(n_layers, d_model, latent_dim, dropout_rate)
 
     def forward(self, molecule_embedding, text_embedding):
-        fused_output = self.attention_fusion(molecule_embedding, text_embedding)
+        fused_output = self.text_conditioned_fusion(molecule_embedding, text_embedding)
         value_output = self.value_mlp(fused_output)
         return value_output.sum()
 
@@ -679,7 +722,7 @@ if __name__ == "__main__":
                         help='Stratified sample N test samples while preserving depth coverage.')
     parser.add_argument('--sample_seed', type=int, default=None,
                         help='Random seed used for sampled test subsets. Defaults to --seed.')
-    parser.add_argument('--pretrain_checkpoint', type=str, default='model/value_function_fusion-model.pkl')
+    parser.add_argument('--pretrain_checkpoint', type=str, default=FUSION_CHECKPOINT_PATH)
     parser.add_argument('--dropout', type=float, default=0.1)
 
     args = parser.parse_args()
@@ -694,7 +737,7 @@ if __name__ == "__main__":
     # device = torch.device("cpu")
 
     fusion_model = FusionModel(600, 768, 600, args.n_layers, args.latent_dim, args.dropout)
-    fusion_model.load_state_dict(torch.load(args.pretrain_checkpoint))
+    fusion_model.load_state_dict(torch.load(args.pretrain_checkpoint, map_location=device))
     fusion_model.to(device)
     fusion_model.eval()
 
