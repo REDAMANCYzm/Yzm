@@ -615,7 +615,7 @@ def stratified_sample_tasks(tasks, sample_size, sample_seed):
     return sampled_tasks
 
 def parse_arguments():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(allow_abbrev=False)
 
     p.add_argument('--config', type=argparse.FileType(mode='r'), default="model/Molecule_representation/runs/PNA_qmugs_NTXentMultiplePositives_620000_123_25-08_09-19-52/12.yml")
     p.add_argument('--experiment_name', type=str, help='name that will be added to the runs folder output')
@@ -705,7 +705,7 @@ def parse_arguments():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument('--mlp_dim', type=int, default=600)
     parser.add_argument('--n_layers', type=int, default=1)
     parser.add_argument('--latent_dim', type=int, default=128)

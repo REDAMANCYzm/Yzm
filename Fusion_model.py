@@ -560,7 +560,7 @@ def get_arguments():
     return args
 
 def parse_arguments():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(allow_abbrev=False)
 
     p.add_argument('--config', type=argparse.FileType(mode='r'), default=os.path.join(BASE_DIR, "model", "Molecule_representation", "runs", "PNA_qmugs_NTXentMultiplePositives_620000_123_25-08_09-19-52", "12.yml"))
     p.add_argument('--experiment_name', type=str, help='name that will be added to the runs folder output')
@@ -648,7 +648,7 @@ def parse_arguments():
     return args
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument('--seed', type=int, default=42, help='Random seed.')
     # ===================== model ====================== #
     parser.add_argument('--fp_dim', type=int, default=600)
