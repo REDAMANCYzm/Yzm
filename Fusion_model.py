@@ -13,6 +13,7 @@ from transformers import AutoModel,AutoTokenizer
 import argparse
 import yaml
 import os
+from datetime import datetime
 import torch.nn as nn
 import logging
 import torch.optim as optim
@@ -58,6 +59,26 @@ def one_k_encoding(value, choices):
     encoding[index] = 1
 
     return encoding
+
+
+def open_log_file(log_path):
+    if not log_path:
+        return None
+    absolute_path = os.path.abspath(log_path)
+    log_dir = os.path.dirname(absolute_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    log_file = open(absolute_path, 'a', encoding='utf-8')
+    log_file.write(f"\n===== Run started at {datetime.now().isoformat(timespec='seconds')} =====\n")
+    log_file.flush()
+    return log_file
+
+
+def log_message(message, log_file=None):
+    print(message)
+    if log_file is not None:
+        log_file.write(f"{message}\n")
+        log_file.flush()
 
 
 class RawFusionDataset(Dataset):
@@ -644,6 +665,7 @@ if __name__ == '__main__':
     parser.add_argument('--build_cache_only', action='store_true')
     parser.add_argument('--cache_path', type=str, default=DEFAULT_CACHE_PATH)
     parser.add_argument('--overwrite_cache', action='store_true')
+    parser.add_argument('--log_file', type=str, default=None)
     # parser.add_argument('--pretrain_checkpoint', type=str, default='value_function_fusion-model.pkl')
 
 
@@ -653,6 +675,7 @@ if __name__ == '__main__':
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     cache_path = os.path.abspath(args.cache_path)
+    log_file = open_log_file(args.log_file)
     dataset_path = os.path.join(BASE_DIR, "data", "fusion-model_traindataset.json")
     scibert_dir = os.path.join(BASE_DIR, 'model', 'scibert')
     pna_checkpoint_path = os.path.join(
@@ -690,8 +713,10 @@ if __name__ == '__main__':
             scibert_dir=scibert_dir,
             pna_checkpoint_path=pna_checkpoint_path
         )
-        print(f"Embedding cache saved to: {cache_path}")
-        print(f"Cached samples: {cache_payload['costs'].size(0)}")
+        log_message(f"Embedding cache saved to: {cache_path}", log_file)
+        log_message(f"Cached samples: {cache_payload['costs'].size(0)}", log_file)
+        if log_file is not None:
+            log_file.close()
         raise SystemExit(0)
 
     if not os.path.exists(cache_path):
@@ -719,12 +744,22 @@ if __name__ == '__main__':
     if val_dataset is not None and len(val_indices) > 0:
         val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
-    print(f"Total samples: {len(dataset)}")
-    print(f"Train samples: {len(train_indices)}")
-    print(f"Validation samples: {len(val_indices)}")
-    print(f"Validation ratio: {args.val_ratio}")
-    print(f"Validation split seed: {args.val_seed}")
-    print(f"Embedding cache: {cache_path}")
+    log_message(f"Total samples: {len(dataset)}", log_file)
+    log_message(f"Train samples: {len(train_indices)}", log_file)
+    log_message(f"Validation samples: {len(val_indices)}", log_file)
+    log_message(f"Validation ratio: {args.val_ratio}", log_file)
+    log_message(f"Validation split seed: {args.val_seed}", log_file)
+    log_message(f"Embedding cache: {cache_path}", log_file)
+    if args.log_file:
+        log_message(f"Training log: {os.path.abspath(args.log_file)}", log_file)
+    log_message(
+        (
+            f"Hyperparameters: batch_size={args.batch_size}, n_epochs={args.n_epochs}, "
+            f"lr={args.lr}, dropout={args.dropout}, latent_dim={args.latent_dim}, "
+            f"n_layers={args.n_layers}, seed={args.seed}"
+        ),
+        log_file
+    )
 
     fusion_model = FusionModel(600, 768, 600, args.n_layers, args.latent_dim, args.dropout)
     # fusion_model.load_state_dict(torch.load(args.pretrain_checkpoint))
@@ -761,16 +796,18 @@ if __name__ == '__main__':
 
         if val_dataloader is not None:
             val_loss, val_mae = evaluate_model(fusion_model, val_dataloader, criterion, device)
-            print(
+            log_message(
                 f"\nEpoch [{epoch + 1}/{args.n_epochs}], "
                 f"Train Loss: {epoch_loss:.4f}, Train MAE: {epoch_mae:.4f}, "
-                f"Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}"
+                f"Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}",
+                log_file
             )
             current_metric = val_loss
         else:
-            print(
+            log_message(
                 f"\nEpoch [{epoch + 1}/{args.n_epochs}], "
-                f"Train Loss: {epoch_loss:.4f}, Train MAE: {epoch_mae:.4f}"
+                f"Train Loss: {epoch_loss:.4f}, Train MAE: {epoch_mae:.4f}",
+                log_file
             )
             current_metric = epoch_loss
 
@@ -778,6 +815,9 @@ if __name__ == '__main__':
             best_metric = current_metric
             torch.save(fusion_model.state_dict(), FUSION_CHECKPOINT_PATH)
             if val_dataloader is not None:
-                print(f"Best model saved with validation loss: {best_metric:.4f}")
+                log_message(f"Best model saved with validation loss: {best_metric:.4f}", log_file)
             else:
-                print(f"Best model saved with training loss: {best_metric:.4f}")
+                log_message(f"Best model saved with training loss: {best_metric:.4f}", log_file)
+
+    if log_file is not None:
+        log_file.close()
