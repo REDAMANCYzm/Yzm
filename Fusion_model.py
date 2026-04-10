@@ -1,6 +1,7 @@
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 import json
+from collections import defaultdict
 from rdkit import Chem
 from rdkit.Chem.rdchem import BondType as BT
 from rdkit.Chem.rdchem import ChiralType
@@ -22,6 +23,16 @@ from model.Molecule_representation.models import *
 from model.Molecule_representation.datasets.samplers import *
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FUSION_CHECKPOINT_PATH = os.path.join(
+    BASE_DIR,
+    'model',
+    'value_function_fusion-model_legacy_val.pkl'
+)
+DEFAULT_CACHE_PATH = os.path.join(
+    BASE_DIR,
+    'data',
+    'fusion_train_embeddings_scibert_pna.pt'
+)
 
 bonds = {BT.SINGLE: 0, BT.DOUBLE: 1, BT.TRIPLE: 2, BT.AROMATIC: 3}
 types = {'H': 0, 'Li': 1, 'B': 2, 'C': 3, 'N': 4, 'O': 5, 'F': 6, 'Na': 7, 'Mg': 8, 'Al': 9, 'Si': 10,
@@ -49,7 +60,7 @@ def one_k_encoding(value, choices):
     return encoding
 
 
-class MyDataset(Dataset):
+class RawFusionDataset(Dataset):
     def __init__(self, file_name, tokenizer, text_model, value_model, device):
         with open(file_name, 'r') as f:
             self.dataset = json.load(f)
@@ -152,7 +163,8 @@ class MyDataset(Dataset):
                 temp = to_dgl(g)
                 temp.edata['feat'] = g.edge_attr.long()
                 temp.ndata['feat'] = g.z.long()
-                v = self.value_model(temp).to(self.device)
+                with torch.no_grad():
+                    v = self.value_model(temp).to(self.device)
                 represent.append(v)
             t = represent[0]
             for ind in range(1, len(represent)):
@@ -163,20 +175,224 @@ class MyDataset(Dataset):
             temp = to_dgl(g)
             temp.edata['feat'] = g.edge_attr.long()
             temp.ndata['feat'] = g.z.long()
-            v = self.value_model(temp).to(self.device)
+            with torch.no_grad():
+                v = self.value_model(temp).to(self.device)
             return v
 
     def text_embedding(self, text):
-        token_text = self.tokenizer(text, max_length=512, return_tensors='pt').to(self.device)
-        embedding = self.text_model(token_text['input_ids'], attention_mask=token_text['attention_mask'])['pooler_output']
+        token_text = self.tokenizer(text, max_length=512, truncation=True, return_tensors='pt').to(self.device)
+        with torch.no_grad():
+            embedding = self.text_model(
+                token_text['input_ids'],
+                attention_mask=token_text['attention_mask']
+            )['pooler_output']
         return embedding
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
-        molecule_representation = torch.tensor(self.represent(item['product']),dtype=torch.float32)
-        text_embedding = torch.tensor(self.text_embedding(item['text']),dtype=torch.float32)
+        molecule_representation = self.represent(item['product']).clone().detach().float()
+        text_embedding = self.text_embedding(item['text']).clone().detach().float()
         cost = torch.tensor(item['cost'], dtype=torch.float32)
         return molecule_representation, text_embedding, cost
+
+    def get_depths(self):
+        return [item.get('depth', 0) for item in self.dataset]
+
+
+class CachedEmbeddingDataset(Dataset):
+    def __init__(self, cache_payload):
+        self.molecule_embeddings = cache_payload['molecule_embeddings'].float()
+        self.text_embeddings = cache_payload['text_embeddings'].float()
+        self.costs = cache_payload['costs'].float()
+        self.depths = cache_payload['depths'].long()
+        self.products = cache_payload['products']
+        self.texts = cache_payload['texts']
+
+    def __len__(self):
+        return self.costs.size(0)
+
+    def __getitem__(self, idx):
+        return (
+            self.molecule_embeddings[idx],
+            self.text_embeddings[idx],
+            self.costs[idx]
+        )
+
+    def get_depths(self):
+        return self.depths.tolist()
+
+
+def squeeze_embedding(embedding, expected_dim, field_name, identifier):
+    embedding = embedding.detach().cpu()
+    if embedding.dim() == 2 and embedding.size(0) == 1:
+        embedding = embedding.squeeze(0)
+    if embedding.dim() != 1 or embedding.size(0) != expected_dim:
+        raise ValueError(
+            f"Expected {field_name} for {identifier} to have shape [{expected_dim}] or [1, {expected_dim}], "
+            f"got {tuple(embedding.shape)}"
+        )
+    return embedding.float()
+
+
+def build_embedding_cache(raw_dataset, cache_path, dataset_path, scibert_dir, pna_checkpoint_path):
+    molecule_embeddings = []
+    text_embeddings = []
+    costs = []
+    depths = []
+    products = []
+    texts = []
+
+    for index in tqdm(range(len(raw_dataset)), desc="Building embedding cache"):
+        item = raw_dataset.dataset[index]
+        product = item['product']
+        text = item['text']
+
+        molecule_embedding = squeeze_embedding(
+            raw_dataset.represent(product),
+            expected_dim=600,
+            field_name='molecule embedding',
+            identifier=product
+        )
+        text_embedding = squeeze_embedding(
+            raw_dataset.text_embedding(text),
+            expected_dim=768,
+            field_name='text embedding',
+            identifier=product
+        )
+
+        molecule_embeddings.append(molecule_embedding)
+        text_embeddings.append(text_embedding)
+        costs.append(float(item['cost']))
+        depths.append(int(item.get('depth', 0)))
+        products.append(product)
+        texts.append(text)
+
+    payload = {
+        'molecule_embeddings': torch.stack(molecule_embeddings, dim=0),
+        'text_embeddings': torch.stack(text_embeddings, dim=0),
+        'costs': torch.tensor(costs, dtype=torch.float32),
+        'depths': torch.tensor(depths, dtype=torch.long),
+        'products': products,
+        'texts': texts,
+        'meta': {
+            'dataset_path': os.path.abspath(dataset_path),
+            'num_samples': len(products),
+            'scibert_dir': os.path.abspath(scibert_dir),
+            'pna_checkpoint_path': os.path.abspath(pna_checkpoint_path),
+        }
+    }
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    torch.save(payload, cache_path)
+    return payload
+
+
+def validate_cache_payload(cache_payload, dataset_path, scibert_dir, pna_checkpoint_path):
+    required_keys = {
+        'molecule_embeddings',
+        'text_embeddings',
+        'costs',
+        'depths',
+        'products',
+        'texts',
+        'meta',
+    }
+    missing_keys = required_keys.difference(cache_payload.keys())
+    if missing_keys:
+        raise ValueError(f"Cache file is missing required keys: {sorted(missing_keys)}")
+
+    meta = cache_payload['meta']
+    expected_meta = {
+        'dataset_path': os.path.abspath(dataset_path),
+        'scibert_dir': os.path.abspath(scibert_dir),
+        'pna_checkpoint_path': os.path.abspath(pna_checkpoint_path),
+    }
+    for key, expected_value in expected_meta.items():
+        actual_value = meta.get(key)
+        if actual_value != expected_value:
+            raise ValueError(
+                f"Cache meta mismatch for {key}: expected {expected_value}, got {actual_value}. "
+                f"Please rebuild the cache."
+            )
+
+    num_samples = meta.get('num_samples')
+    actual_num_samples = cache_payload['costs'].size(0)
+    if num_samples != actual_num_samples:
+        raise ValueError(
+            f"Cache num_samples mismatch: meta says {num_samples}, tensors contain {actual_num_samples}. "
+            f"Please rebuild the cache."
+        )
+
+    if cache_payload['molecule_embeddings'].size(0) != actual_num_samples:
+        raise ValueError("Molecule embedding count does not match costs count in cache.")
+    if cache_payload['text_embeddings'].size(0) != actual_num_samples:
+        raise ValueError("Text embedding count does not match costs count in cache.")
+    if cache_payload['depths'].size(0) != actual_num_samples:
+        raise ValueError("Depth count does not match costs count in cache.")
+    if len(cache_payload['products']) != actual_num_samples:
+        raise ValueError("Product count does not match costs count in cache.")
+    if len(cache_payload['texts']) != actual_num_samples:
+        raise ValueError("Text count does not match costs count in cache.")
+
+
+def build_stratified_train_val_subsets(dataset, val_ratio, seed):
+    if val_ratio <= 0:
+        indices = list(range(len(dataset)))
+        return Subset(dataset, indices), None, indices, []
+
+    grouped_indices = defaultdict(list)
+    for index, depth in enumerate(dataset.get_depths()):
+        grouped_indices[depth].append(index)
+
+    rng = np.random.default_rng(seed)
+    train_indices = []
+    val_indices = []
+
+    for depth in sorted(grouped_indices):
+        depth_indices = list(grouped_indices[depth])
+        rng.shuffle(depth_indices)
+
+        if len(depth_indices) <= 1:
+            train_indices.extend(depth_indices)
+            continue
+
+        proposed_val_size = int(round(len(depth_indices) * val_ratio))
+        val_size = max(1, proposed_val_size)
+        val_size = min(len(depth_indices) - 1, val_size)
+
+        val_indices.extend(depth_indices[:val_size])
+        train_indices.extend(depth_indices[val_size:])
+
+    rng.shuffle(train_indices)
+    rng.shuffle(val_indices)
+
+    return Subset(dataset, train_indices), Subset(dataset, val_indices), train_indices, val_indices
+
+
+def evaluate_model(fusion_model, dataloader, criterion, device):
+    fusion_model.eval()
+    total_loss = 0.0
+    total_mae = 0.0
+    total_samples = 0
+
+    with torch.no_grad():
+        for molecule_embeddings, text_embeddings, costs in dataloader:
+            molecule_embeddings = molecule_embeddings.to(device)
+            text_embeddings = text_embeddings.to(device)
+            costs = costs.to(device)
+
+            outputs = fusion_model(molecule_embeddings, text_embeddings)
+            costs = costs.view_as(outputs)
+            batch_size = costs.size(0)
+
+            total_loss += criterion(outputs, costs).item() * batch_size
+            total_mae += torch.abs(outputs - costs).sum().item()
+            total_samples += batch_size
+
+    if total_samples == 0:
+        return None, None
+
+    return total_loss / total_samples, total_mae / total_samples
 
 class ValueMLP(nn.Module):
     def __init__(self, n_layers, fp_dim, latent_dim, dropout_rate):
@@ -360,7 +576,8 @@ def parse_arguments():
     p.add_argument('--force_random_split', type=bool, default=False, help='use random split for ogb')
     p.add_argument('--reuse_pre_train_data', type=bool, default=False, help='use all data instead of ignoring that used during pre-training')
     p.add_argument('--transfer_3d', type=bool, default=False, help='set true to load the 3d network instead of the 2d network')
-    return p.parse_args()
+    args, _ = p.parse_known_args()
+    return args
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -375,38 +592,102 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--dropout', type=float, default=0.1)
-    # parser.add_argument('--pretrain_checkpoint', type=str, default='value_function_fusion-model.pkl')
-
+    parser.add_argument('--val_ratio', type=float, default=0.1)
+    parser.add_argument('--val_seed', type=int, default=42)
+    parser.add_argument('--build_cache_only', action='store_true')
+    parser.add_argument('--cache_path', type=str, default=DEFAULT_CACHE_PATH)
+    parser.add_argument('--overwrite_cache', action='store_true')
 
     args = parser.parse_args()
+    if not 0 <= args.val_ratio < 1:
+        raise ValueError(f"--val_ratio must be in [0, 1), got {args.val_ratio}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    tokenizer = AutoTokenizer.from_pretrained(os.path.join(BASE_DIR, 'model', 'scibert'))
-    text_model = AutoModel.from_pretrained(os.path.join(BASE_DIR, 'model', 'scibert'))
+    cache_path = os.path.abspath(args.cache_path)
+    dataset_path = os.path.join(BASE_DIR, "data", "fusion-model_traindataset.json")
+    scibert_dir = os.path.join(BASE_DIR, 'model', 'scibert')
+    pna_checkpoint_path = os.path.join(
+        BASE_DIR,
+        "model",
+        "Molecule_representation",
+        "runs",
+        "PNA_qmugs_NTXentMultiplePositives_620000_123_25-08_09-19-52",
+        "best_checkpoint_35epochs.pt"
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(scibert_dir)
+    text_model = AutoModel.from_pretrained(scibert_dir)
     text_model.to(device)
+    text_model.eval()
 
     args_value = get_arguments()
-    checkpoint = torch.load(os.path.join(BASE_DIR, "model", "Molecule_representation", "runs", "PNA_qmugs_NTXentMultiplePositives_620000_123_25-08_09-19-52", "best_checkpoint_35epochs.pt"),
-        map_location=device)
+    checkpoint = torch.load(pna_checkpoint_path, map_location=device)
     value_model = globals()[args_value.model_type](node_dim=74, edge_dim=4,
                                                    **args_value.model_parameters)
     value_model.load_state_dict(checkpoint['model_state_dict'])
+    value_model.eval()
 
-    file_name = os.path.join(BASE_DIR, "data", "fusion-model_traindataset.json")
-    dataset = MyDataset(file_name, tokenizer, text_model, value_model, device)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    if args.build_cache_only and os.path.exists(cache_path) and not args.overwrite_cache:
+        raise FileExistsError(
+            f"Cache already exists at {cache_path}. Use --overwrite_cache to rebuild it."
+        )
+
+    if args.build_cache_only:
+        raw_dataset = RawFusionDataset(dataset_path, tokenizer, text_model, value_model, device)
+        cache_payload = build_embedding_cache(
+            raw_dataset,
+            cache_path=cache_path,
+            dataset_path=dataset_path,
+            scibert_dir=scibert_dir,
+            pna_checkpoint_path=pna_checkpoint_path
+        )
+        print(f"Embedding cache saved to: {cache_path}")
+        print(f"Cached samples: {cache_payload['costs'].size(0)}")
+        raise SystemExit(0)
+
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(
+            f"Embedding cache not found at {cache_path}. "
+            f"Run `python Fusion_model.py --build_cache_only` first."
+        )
+
+    cache_payload = torch.load(cache_path, map_location='cpu')
+    validate_cache_payload(
+        cache_payload,
+        dataset_path=dataset_path,
+        scibert_dir=scibert_dir,
+        pna_checkpoint_path=pna_checkpoint_path
+    )
+    dataset = CachedEmbeddingDataset(cache_payload)
+    train_dataset, val_dataset, train_indices, val_indices = build_stratified_train_val_subsets(
+        dataset,
+        args.val_ratio,
+        args.val_seed
+    )
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_dataloader = None
+    if val_dataset is not None and len(val_indices) > 0:
+        val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+
+    print(f"Total samples: {len(dataset)}")
+    print(f"Train samples: {len(train_indices)}")
+    print(f"Validation samples: {len(val_indices)}")
+    print(f"Validation ratio: {args.val_ratio}")
+    print(f"Validation split seed: {args.val_seed}")
+    print(f"Embedding cache: {cache_path}")
 
     fusion_model = FusionModel(600, 768, 600, args.n_layers, args.latent_dim, args.dropout)
-    # fusion_model.load_state_dict(torch.load(args.pretrain_checkpoint))
     fusion_model.to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(fusion_model.parameters(), lr=args.lr)
 
-    best_loss = float('inf')
+    best_metric = float('inf')
     for epoch in range(args.n_epochs):
         fusion_model.train()
         running_loss = 0.0
-        for batch in tqdm(dataloader):
+        running_mae = 0.0
+        seen_samples = 0
+        for batch in tqdm(train_dataloader):
             molecule_embeddings, text_embeddings, costs = batch
             molecule_embeddings = molecule_embeddings.to(device)
             text_embeddings = text_embeddings.to(device)
@@ -414,15 +695,38 @@ if __name__ == '__main__':
 
             optimizer.zero_grad()
             outputs = fusion_model(molecule_embeddings, text_embeddings)
+            costs = costs.view_as(outputs)
             loss = criterion(outputs, costs)
             loss.backward()
             optimizer.step()
 
-            running_loss += loss.item()
+            batch_size = costs.size(0)
+            running_loss += loss.item() * batch_size
+            running_mae += torch.abs(outputs.detach() - costs).sum().item()
+            seen_samples += batch_size
 
-        epoch_loss = running_loss / len(dataloader)
-        print(f"\nEpoch [{epoch + 1}/{args.n_epochs}], Loss: {epoch_loss:.4f}")
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-            torch.save(fusion_model.state_dict(), os.path.join(BASE_DIR, 'model', 'value_function_fusion-model.pkl'))
-            print(f"Best model saved with loss: {best_loss:.4f}")
+        epoch_loss = running_loss / seen_samples
+        epoch_mae = running_mae / seen_samples
+
+        if val_dataloader is not None:
+            val_loss, val_mae = evaluate_model(fusion_model, val_dataloader, criterion, device)
+            print(
+                f"\nEpoch [{epoch + 1}/{args.n_epochs}], "
+                f"Train Loss: {epoch_loss:.4f}, Train MAE: {epoch_mae:.4f}, "
+                f"Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}"
+            )
+            current_metric = val_loss
+        else:
+            print(
+                f"\nEpoch [{epoch + 1}/{args.n_epochs}], "
+                f"Train Loss: {epoch_loss:.4f}, Train MAE: {epoch_mae:.4f}"
+            )
+            current_metric = epoch_loss
+
+        if current_metric < best_metric:
+            best_metric = current_metric
+            torch.save(fusion_model.state_dict(), FUSION_CHECKPOINT_PATH)
+            if val_dataloader is not None:
+                print(f"Best model saved with validation loss: {best_metric:.4f}")
+            else:
+                print(f"Best model saved with training loss: {best_metric:.4f}")

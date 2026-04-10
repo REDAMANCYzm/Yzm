@@ -37,6 +37,7 @@ DisableLog('rdApp.warning')
 DisableLog('rdApp.error')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FUSION_CHECKPOINT_PATH = os.path.join(BASE_DIR, 'model', 'value_function_fusion-model_legacy_val.pkl')
 reactant_tokenizer = None
 reactant_model = None
 
@@ -679,7 +680,7 @@ if __name__ == "__main__":
                         help='Stratified sample N test samples while preserving depth coverage.')
     parser.add_argument('--sample_seed', type=int, default=None,
                         help='Random seed used for sampled test subsets. Defaults to --seed.')
-    parser.add_argument('--pretrain_checkpoint', type=str, default='model/value_function_fusion-model.pkl')
+    parser.add_argument('--pretrain_checkpoint', type=str, default=FUSION_CHECKPOINT_PATH)
     parser.add_argument('--dropout', type=float, default=0.1)
 
     args = parser.parse_args()
@@ -694,7 +695,7 @@ if __name__ == "__main__":
     # device = torch.device("cpu")
 
     fusion_model = FusionModel(600, 768, 600, args.n_layers, args.latent_dim, args.dropout)
-    fusion_model.load_state_dict(torch.load(args.pretrain_checkpoint))
+    fusion_model.load_state_dict(torch.load(args.pretrain_checkpoint, map_location=device))
     fusion_model.to(device)
     fusion_model.eval()
 
