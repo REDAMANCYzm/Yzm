@@ -28,6 +28,11 @@ FUSION_CHECKPOINT_PATH = os.path.join(
     'model',
     'value_function_text_conditioned_fusion-model_val.pkl'
 )
+DEFAULT_CACHE_PATH = os.path.join(
+    BASE_DIR,
+    'data',
+    'fusion_train_embeddings_scibert_pna.pt'
+)
 
 bonds = {BT.SINGLE: 0, BT.DOUBLE: 1, BT.TRIPLE: 2, BT.AROMATIC: 3}
 types = {'H': 0, 'Li': 1, 'B': 2, 'C': 3, 'N': 4, 'O': 5, 'F': 6, 'Na': 7, 'Mg': 8, 'Al': 9, 'Si': 10,
@@ -55,7 +60,7 @@ def one_k_encoding(value, choices):
     return encoding
 
 
-class MyDataset(Dataset):
+class RawFusionDataset(Dataset):
     def __init__(self, file_name, tokenizer, text_model, value_model, device):
         with open(file_name, 'r') as f:
             self.dataset = json.load(f)
@@ -190,6 +195,145 @@ class MyDataset(Dataset):
         cost = torch.tensor(item['cost'], dtype=torch.float32)
         return molecule_representation, text_embedding, cost
 
+    def get_depths(self):
+        return [item.get('depth', 0) for item in self.dataset]
+
+
+class CachedEmbeddingDataset(Dataset):
+    def __init__(self, cache_payload):
+        self.molecule_embeddings = cache_payload['molecule_embeddings'].float()
+        self.text_embeddings = cache_payload['text_embeddings'].float()
+        self.costs = cache_payload['costs'].float()
+        self.depths = cache_payload['depths'].long()
+        self.products = cache_payload['products']
+        self.texts = cache_payload['texts']
+
+    def __len__(self):
+        return self.costs.size(0)
+
+    def __getitem__(self, idx):
+        return (
+            self.molecule_embeddings[idx],
+            self.text_embeddings[idx],
+            self.costs[idx]
+        )
+
+    def get_depths(self):
+        return self.depths.tolist()
+
+
+def squeeze_embedding(embedding, expected_dim, field_name, identifier):
+    embedding = embedding.detach().cpu()
+    if embedding.dim() == 2 and embedding.size(0) == 1:
+        embedding = embedding.squeeze(0)
+    if embedding.dim() != 1 or embedding.size(0) != expected_dim:
+        raise ValueError(
+            f"Expected {field_name} for {identifier} to have shape [{expected_dim}] or [1, {expected_dim}], "
+            f"got {tuple(embedding.shape)}"
+        )
+    return embedding.float()
+
+
+def build_embedding_cache(raw_dataset, cache_path, dataset_path, scibert_dir, pna_checkpoint_path):
+    molecule_embeddings = []
+    text_embeddings = []
+    costs = []
+    depths = []
+    products = []
+    texts = []
+
+    for index in tqdm(range(len(raw_dataset)), desc="Building embedding cache"):
+        item = raw_dataset.dataset[index]
+        product = item['product']
+        text = item['text']
+
+        molecule_embedding = squeeze_embedding(
+            raw_dataset.represent(product),
+            expected_dim=600,
+            field_name='molecule embedding',
+            identifier=product
+        )
+        text_embedding = squeeze_embedding(
+            raw_dataset.text_embedding(text),
+            expected_dim=768,
+            field_name='text embedding',
+            identifier=product
+        )
+
+        molecule_embeddings.append(molecule_embedding)
+        text_embeddings.append(text_embedding)
+        costs.append(float(item['cost']))
+        depths.append(int(item.get('depth', 0)))
+        products.append(product)
+        texts.append(text)
+
+    payload = {
+        'molecule_embeddings': torch.stack(molecule_embeddings, dim=0),
+        'text_embeddings': torch.stack(text_embeddings, dim=0),
+        'costs': torch.tensor(costs, dtype=torch.float32),
+        'depths': torch.tensor(depths, dtype=torch.long),
+        'products': products,
+        'texts': texts,
+        'meta': {
+            'dataset_path': os.path.abspath(dataset_path),
+            'num_samples': len(products),
+            'scibert_dir': os.path.abspath(scibert_dir),
+            'pna_checkpoint_path': os.path.abspath(pna_checkpoint_path),
+        }
+    }
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    torch.save(payload, cache_path)
+    return payload
+
+
+def validate_cache_payload(cache_payload, dataset_path, scibert_dir, pna_checkpoint_path):
+    required_keys = {
+        'molecule_embeddings',
+        'text_embeddings',
+        'costs',
+        'depths',
+        'products',
+        'texts',
+        'meta',
+    }
+    missing_keys = required_keys.difference(cache_payload.keys())
+    if missing_keys:
+        raise ValueError(f"Cache file is missing required keys: {sorted(missing_keys)}")
+
+    meta = cache_payload['meta']
+    expected_meta = {
+        'dataset_path': os.path.abspath(dataset_path),
+        'scibert_dir': os.path.abspath(scibert_dir),
+        'pna_checkpoint_path': os.path.abspath(pna_checkpoint_path),
+    }
+    for key, expected_value in expected_meta.items():
+        actual_value = meta.get(key)
+        if actual_value != expected_value:
+            raise ValueError(
+                f"Cache meta mismatch for {key}: expected {expected_value}, got {actual_value}. "
+                f"Please rebuild the cache."
+            )
+
+    num_samples = meta.get('num_samples')
+    actual_num_samples = cache_payload['costs'].size(0)
+    if num_samples != actual_num_samples:
+        raise ValueError(
+            f"Cache num_samples mismatch: meta says {num_samples}, tensors contain {actual_num_samples}. "
+            f"Please rebuild the cache."
+        )
+
+    if cache_payload['molecule_embeddings'].size(0) != actual_num_samples:
+        raise ValueError("Molecule embedding count does not match costs count in cache.")
+    if cache_payload['text_embeddings'].size(0) != actual_num_samples:
+        raise ValueError("Text embedding count does not match costs count in cache.")
+    if cache_payload['depths'].size(0) != actual_num_samples:
+        raise ValueError("Depth count does not match costs count in cache.")
+    if len(cache_payload['products']) != actual_num_samples:
+        raise ValueError("Product count does not match costs count in cache.")
+    if len(cache_payload['texts']) != actual_num_samples:
+        raise ValueError("Text count does not match costs count in cache.")
+
 
 def build_stratified_train_val_subsets(dataset, val_ratio, seed):
     if val_ratio <= 0:
@@ -197,8 +341,8 @@ def build_stratified_train_val_subsets(dataset, val_ratio, seed):
         return Subset(dataset, indices), None, indices, []
 
     grouped_indices = defaultdict(list)
-    for index, item in enumerate(dataset.dataset):
-        grouped_indices[item.get('depth', 0)].append(index)
+    for index, depth in enumerate(dataset.get_depths()):
+        grouped_indices[depth].append(index)
 
     rng = np.random.default_rng(seed)
     train_indices = []
@@ -497,6 +641,9 @@ if __name__ == '__main__':
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--val_ratio', type=float, default=0.1)
     parser.add_argument('--val_seed', type=int, default=42)
+    parser.add_argument('--build_cache_only', action='store_true')
+    parser.add_argument('--cache_path', type=str, default=DEFAULT_CACHE_PATH)
+    parser.add_argument('--overwrite_cache', action='store_true')
     # parser.add_argument('--pretrain_checkpoint', type=str, default='value_function_fusion-model.pkl')
 
 
@@ -505,21 +652,63 @@ if __name__ == '__main__':
         raise ValueError(f"--val_ratio must be in [0, 1), got {args.val_ratio}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    tokenizer = AutoTokenizer.from_pretrained(os.path.join(BASE_DIR, 'model', 'scibert'))
-    text_model = AutoModel.from_pretrained(os.path.join(BASE_DIR, 'model', 'scibert'))
+    cache_path = os.path.abspath(args.cache_path)
+    dataset_path = os.path.join(BASE_DIR, "data", "fusion-model_traindataset.json")
+    scibert_dir = os.path.join(BASE_DIR, 'model', 'scibert')
+    pna_checkpoint_path = os.path.join(
+        BASE_DIR,
+        "model",
+        "Molecule_representation",
+        "runs",
+        "PNA_qmugs_NTXentMultiplePositives_620000_123_25-08_09-19-52",
+        "best_checkpoint_35epochs.pt"
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(scibert_dir)
+    text_model = AutoModel.from_pretrained(scibert_dir)
     text_model.to(device)
     text_model.eval()
 
     args_value = get_arguments()
-    checkpoint = torch.load(os.path.join(BASE_DIR, "model", "Molecule_representation", "runs", "PNA_qmugs_NTXentMultiplePositives_620000_123_25-08_09-19-52", "best_checkpoint_35epochs.pt"),
-        map_location=device)
+    checkpoint = torch.load(pna_checkpoint_path, map_location=device)
     value_model = globals()[args_value.model_type](node_dim=74, edge_dim=4,
                                                    **args_value.model_parameters)
     value_model.load_state_dict(checkpoint['model_state_dict'])
     value_model.eval()
 
-    file_name = os.path.join(BASE_DIR, "data", "fusion-model_traindataset.json")
-    dataset = MyDataset(file_name, tokenizer, text_model, value_model, device)
+    if args.build_cache_only and os.path.exists(cache_path) and not args.overwrite_cache:
+        raise FileExistsError(
+            f"Cache already exists at {cache_path}. Use --overwrite_cache to rebuild it."
+        )
+
+    if args.build_cache_only:
+        raw_dataset = RawFusionDataset(dataset_path, tokenizer, text_model, value_model, device)
+        cache_payload = build_embedding_cache(
+            raw_dataset,
+            cache_path=cache_path,
+            dataset_path=dataset_path,
+            scibert_dir=scibert_dir,
+            pna_checkpoint_path=pna_checkpoint_path
+        )
+        print(f"Embedding cache saved to: {cache_path}")
+        print(f"Cached samples: {cache_payload['costs'].size(0)}")
+        raise SystemExit(0)
+
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(
+            f"Embedding cache not found at {cache_path}. "
+            f"Run `python Fusion_model.py --build_cache_only` first."
+        )
+
+    cache_payload = torch.load(cache_path, map_location='cpu')
+    validate_cache_payload(
+        cache_payload,
+        dataset_path=dataset_path,
+        scibert_dir=scibert_dir,
+        pna_checkpoint_path=pna_checkpoint_path
+    )
+
+    dataset = CachedEmbeddingDataset(cache_payload)
     train_dataset, val_dataset, train_indices, val_indices = build_stratified_train_val_subsets(
         dataset,
         args.val_ratio,
@@ -535,6 +724,7 @@ if __name__ == '__main__':
     print(f"Validation samples: {len(val_indices)}")
     print(f"Validation ratio: {args.val_ratio}")
     print(f"Validation split seed: {args.val_seed}")
+    print(f"Embedding cache: {cache_path}")
 
     fusion_model = FusionModel(600, 768, 600, args.n_layers, args.latent_dim, args.dropout)
     # fusion_model.load_state_dict(torch.load(args.pretrain_checkpoint))
