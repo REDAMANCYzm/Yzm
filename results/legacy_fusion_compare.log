@@ -1,0 +1,62 @@
+
+===== Run started at 2026-04-10T13:36:56 =====
+Total samples: 46450
+Train samples: 41805
+Validation samples: 4645
+Validation ratio: 0.1
+Validation split seed: 42
+Embedding cache: /home/linx/yanzm/RetroInText-main/RetroInText-main/data/fusion_train_embeddings_scibert_pna.pt
+Training log: /home/linx/yanzm/RetroInText-main/RetroInText-main/results/legacy_fusion_compare.log
+Hyperparameters: batch_size=128, n_epochs=20, lr=0.001, dropout=0.1, latent_dim=128, n_layers=1, seed=42
+
+Epoch [1/20], Train Loss: 0.9079, Train MAE: 0.6017, Val Loss: 0.5366, Val MAE: 0.5669
+Best model saved with validation loss: 0.5366
+
+Epoch [2/20], Train Loss: 0.5845, Train MAE: 0.5511, Val Loss: 0.5428, Val MAE: 0.5166
+
+Epoch [3/20], Train Loss: 0.5795, Train MAE: 0.5465, Val Loss: 0.5333, Val MAE: 0.5746
+Best model saved with validation loss: 0.5333
+
+Epoch [4/20], Train Loss: 0.5733, Train MAE: 0.5429, Val Loss: 0.5061, Val MAE: 0.5269
+Best model saved with validation loss: 0.5061
+
+Epoch [5/20], Train Loss: 0.5579, Train MAE: 0.5260, Val Loss: 0.4842, Val MAE: 0.5331
+Best model saved with validation loss: 0.4842
+
+Epoch [6/20], Train Loss: 0.5418, Train MAE: 0.5101, Val Loss: 0.4390, Val MAE: 0.4846
+Best model saved with validation loss: 0.4390
+
+Epoch [7/20], Train Loss: 0.5407, Train MAE: 0.5114, Val Loss: 0.4464, Val MAE: 0.4719
+
+Epoch [8/20], Train Loss: 0.5285, Train MAE: 0.4980, Val Loss: 0.4633, Val MAE: 0.4545
+
+Epoch [9/20], Train Loss: 0.4967, Train MAE: 0.4812, Val Loss: 0.4362, Val MAE: 0.4802
+Best model saved with validation loss: 0.4362
+
+Epoch [10/20], Train Loss: 0.5091, Train MAE: 0.4894, Val Loss: 0.4120, Val MAE: 0.4595
+Best model saved with validation loss: 0.4120
+
+Epoch [11/20], Train Loss: 0.4778, Train MAE: 0.4714, Val Loss: 0.4076, Val MAE: 0.4587
+Best model saved with validation loss: 0.4076
+
+Epoch [12/20], Train Loss: 0.5185, Train MAE: 0.4968, Val Loss: 0.4006, Val MAE: 0.4394
+Best model saved with validation loss: 0.4006
+
+Epoch [13/20], Train Loss: 0.4604, Train MAE: 0.4611, Val Loss: 0.3874, Val MAE: 0.4465
+Best model saved with validation loss: 0.3874
+
+Epoch [14/20], Train Loss: 0.4591, Train MAE: 0.4600, Val Loss: 0.4108, Val MAE: 0.4352
+
+Epoch [15/20], Train Loss: 0.4514, Train MAE: 0.4563, Val Loss: 0.3770, Val MAE: 0.4342
+Best model saved with validation loss: 0.3770
+
+Epoch [16/20], Train Loss: 0.5097, Train MAE: 0.4889, Val Loss: 0.3943, Val MAE: 0.4563
+
+Epoch [17/20], Train Loss: 0.4545, Train MAE: 0.4619, Val Loss: 0.3904, Val MAE: 0.4649
+
+Epoch [18/20], Train Loss: 0.4521, Train MAE: 0.4609, Val Loss: 0.3735, Val MAE: 0.4423
+Best model saved with validation loss: 0.3735
+
+Epoch [19/20], Train Loss: 0.4609, Train MAE: 0.4657, Val Loss: 0.3822, Val MAE: 0.4563
+
+Epoch [20/20], Train Loss: 0.4536, Train MAE: 0.4614, Val Loss: 0.3755, Val MAE: 0.4367
