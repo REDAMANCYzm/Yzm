@@ -2,6 +2,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader, Subset
 import json
 from collections import defaultdict
+import dgl
 from rdkit import Chem
 from rdkit.Chem.rdchem import BondType as BT
 from rdkit.Chem.rdchem import ChiralType
@@ -58,6 +59,13 @@ def one_k_encoding(value, choices):
     encoding[index] = 1
 
     return encoding
+
+
+def get_module_device(module):
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return torch.device('cpu')
 
 
 class RawFusionDataset(Dataset):
@@ -155,38 +163,76 @@ class RawFusionDataset(Dataset):
                     name=smiles, num_nodes=N)
         return data
 
+    def build_dgl_graph(self, smi):
+        g = self.featurize_mol_from_smiles(smi)
+        temp = to_dgl(g)
+        temp.edata['feat'] = g.edge_attr.long()
+        temp.ndata['feat'] = g.z.long()
+        return temp
+
     def represent(self, smi):
         if '.' in smi:
             represent = []
             for s in smi.split('.'):
-                g = self.featurize_mol_from_smiles(s)
-                temp = to_dgl(g)
-                temp.edata['feat'] = g.edge_attr.long()
-                temp.ndata['feat'] = g.z.long()
+                temp = self.build_dgl_graph(s)
+                value_device = get_module_device(self.value_model)
+                if value_device.type != 'cpu':
+                    temp = temp.to(value_device)
                 with torch.no_grad():
-                    v = self.value_model(temp).to(self.device)
+                    v = self.value_model(temp)
                 represent.append(v)
             t = represent[0]
             for ind in range(1, len(represent)):
                 t = torch.concat((t, represent[ind]), 0)
             return t
         else:
-            g = self.featurize_mol_from_smiles(smi)
-            temp = to_dgl(g)
-            temp.edata['feat'] = g.edge_attr.long()
-            temp.ndata['feat'] = g.z.long()
+            temp = self.build_dgl_graph(smi)
+            value_device = get_module_device(self.value_model)
+            if value_device.type != 'cpu':
+                temp = temp.to(value_device)
             with torch.no_grad():
-                v = self.value_model(temp).to(self.device)
+                v = self.value_model(temp)
             return v
 
     def text_embedding(self, text):
-        token_text = self.tokenizer(text, max_length=512, truncation=True, return_tensors='pt').to(self.device)
+        text_device = get_module_device(self.text_model)
+        token_text = self.tokenizer(text, max_length=512, truncation=True, return_tensors='pt').to(text_device)
         with torch.no_grad():
             embedding = self.text_model(
                 token_text['input_ids'],
                 attention_mask=token_text['attention_mask']
             )['pooler_output']
         return embedding
+
+    def represent_batch(self, smiles_batch):
+        if any('.' in smi for smi in smiles_batch):
+            raise ValueError("Batch molecule embedding cache only supports single-fragment products.")
+
+        graphs = [self.build_dgl_graph(smi) for smi in smiles_batch]
+        batched_graph = dgl.batch(graphs)
+        value_device = get_module_device(self.value_model)
+        if value_device.type != 'cpu':
+            batched_graph = batched_graph.to(value_device)
+
+        with torch.no_grad():
+            embeddings = self.value_model(batched_graph)
+        return embeddings.detach().cpu()
+
+    def text_embedding_batch(self, text_batch):
+        text_device = get_module_device(self.text_model)
+        token_text = self.tokenizer(
+            text_batch,
+            max_length=512,
+            truncation=True,
+            padding=True,
+            return_tensors='pt'
+        ).to(text_device)
+        with torch.no_grad():
+            embeddings = self.text_model(
+                token_text['input_ids'],
+                attention_mask=token_text['attention_mask']
+            )['pooler_output']
+        return embeddings.detach().cpu()
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
@@ -234,7 +280,7 @@ def squeeze_embedding(embedding, expected_dim, field_name, identifier):
     return embedding.float()
 
 
-def build_embedding_cache(raw_dataset, cache_path, dataset_path, scibert_dir, pna_checkpoint_path):
+def build_embedding_cache(raw_dataset, cache_path, dataset_path, scibert_dir, pna_checkpoint_path, batch_size):
     molecule_embeddings = []
     text_embeddings = []
     costs = []
@@ -242,30 +288,41 @@ def build_embedding_cache(raw_dataset, cache_path, dataset_path, scibert_dir, pn
     products = []
     texts = []
 
-    for index in tqdm(range(len(raw_dataset)), desc="Building embedding cache"):
-        item = raw_dataset.dataset[index]
-        product = item['product']
-        text = item['text']
+    for start in tqdm(range(0, len(raw_dataset), batch_size), desc="Building embedding cache"):
+        batch_items = raw_dataset.dataset[start:start + batch_size]
+        batch_products = [item['product'] for item in batch_items]
+        batch_texts = [item['text'] for item in batch_items]
 
-        molecule_embedding = squeeze_embedding(
-            raw_dataset.represent(product),
-            expected_dim=600,
-            field_name='molecule embedding',
-            identifier=product
-        )
-        text_embedding = squeeze_embedding(
-            raw_dataset.text_embedding(text),
-            expected_dim=768,
-            field_name='text embedding',
-            identifier=product
-        )
+        batch_molecule_embeddings = raw_dataset.represent_batch(batch_products)
+        batch_text_embeddings = raw_dataset.text_embedding_batch(batch_texts)
 
-        molecule_embeddings.append(molecule_embedding)
-        text_embeddings.append(text_embedding)
-        costs.append(float(item['cost']))
-        depths.append(int(item.get('depth', 0)))
-        products.append(product)
-        texts.append(text)
+        for item, molecule_embedding, text_embedding in zip(
+            batch_items,
+            batch_molecule_embeddings,
+            batch_text_embeddings
+        ):
+            product = item['product']
+            text = item['text']
+
+            molecule_embedding = squeeze_embedding(
+                molecule_embedding,
+                expected_dim=600,
+                field_name='molecule embedding',
+                identifier=product
+            )
+            text_embedding = squeeze_embedding(
+                text_embedding,
+                expected_dim=768,
+                field_name='text embedding',
+                identifier=product
+            )
+
+            molecule_embeddings.append(molecule_embedding)
+            text_embeddings.append(text_embedding)
+            costs.append(float(item['cost']))
+            depths.append(int(item.get('depth', 0)))
+            products.append(product)
+            texts.append(text)
 
     payload = {
         'molecule_embeddings': torch.stack(molecule_embeddings, dim=0),
@@ -597,10 +654,13 @@ if __name__ == '__main__':
     parser.add_argument('--build_cache_only', action='store_true')
     parser.add_argument('--cache_path', type=str, default=DEFAULT_CACHE_PATH)
     parser.add_argument('--overwrite_cache', action='store_true')
+    parser.add_argument('--cache_batch_size', type=int, default=64)
 
     args = parser.parse_args()
     if not 0 <= args.val_ratio < 1:
         raise ValueError(f"--val_ratio must be in [0, 1), got {args.val_ratio}")
+    if args.cache_batch_size <= 0:
+        raise ValueError(f"--cache_batch_size must be positive, got {args.cache_batch_size}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     cache_path = os.path.abspath(args.cache_path)
@@ -615,31 +675,32 @@ if __name__ == '__main__':
         "best_checkpoint_35epochs.pt"
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(scibert_dir)
-    text_model = AutoModel.from_pretrained(scibert_dir)
-    text_model.to(device)
-    text_model.eval()
-
-    args_value = get_arguments()
-    checkpoint = torch.load(pna_checkpoint_path, map_location=device)
-    value_model = globals()[args_value.model_type](node_dim=74, edge_dim=4,
-                                                   **args_value.model_parameters)
-    value_model.load_state_dict(checkpoint['model_state_dict'])
-    value_model.eval()
-
     if args.build_cache_only and os.path.exists(cache_path) and not args.overwrite_cache:
         raise FileExistsError(
             f"Cache already exists at {cache_path}. Use --overwrite_cache to rebuild it."
         )
 
     if args.build_cache_only:
+        tokenizer = AutoTokenizer.from_pretrained(scibert_dir)
+        text_model = AutoModel.from_pretrained(scibert_dir)
+        text_model.to(device)
+        text_model.eval()
+
+        args_value = get_arguments()
+        checkpoint = torch.load(pna_checkpoint_path, map_location=device)
+        value_model = globals()[args_value.model_type](node_dim=74, edge_dim=4,
+                                                       **args_value.model_parameters)
+        value_model.load_state_dict(checkpoint['model_state_dict'])
+        value_model.eval()
+
         raw_dataset = RawFusionDataset(dataset_path, tokenizer, text_model, value_model, device)
         cache_payload = build_embedding_cache(
             raw_dataset,
             cache_path=cache_path,
             dataset_path=dataset_path,
             scibert_dir=scibert_dir,
-            pna_checkpoint_path=pna_checkpoint_path
+            pna_checkpoint_path=pna_checkpoint_path,
+            batch_size=args.cache_batch_size
         )
         print(f"Embedding cache saved to: {cache_path}")
         print(f"Cached samples: {cache_payload['costs'].size(0)}")
