@@ -22,6 +22,7 @@ import numpy as np
 from model.Molecule_representation.commons.losses import *
 from model.Molecule_representation.models import *
 from model.Molecule_representation.datasets.samplers import *
+from training_curve_png import default_curve_path as default_curve_png_path, save_training_curves_png
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FUSION_CHECKPOINT_PATH = os.path.join(
@@ -79,6 +80,18 @@ def log_message(message, log_file=None):
     if log_file is not None:
         log_file.write(f"{message}\n")
         log_file.flush()
+
+
+def default_curve_path(log_path):
+    return default_curve_png_path(log_path)
+
+
+def _resolve_curve_path(log_path, curve_path):
+    if curve_path:
+        return os.path.abspath(curve_path)
+    if log_path:
+        return default_curve_path(log_path)
+    return None
 
 
 class RawFusionDataset(Dataset):
@@ -666,6 +679,8 @@ if __name__ == '__main__':
     parser.add_argument('--cache_path', type=str, default=DEFAULT_CACHE_PATH)
     parser.add_argument('--overwrite_cache', action='store_true')
     parser.add_argument('--log_file', type=str, default=None)
+    parser.add_argument('--curve_path', type=str, default=None,
+                        help='Optional PNG path for training curves. Defaults next to --log_file.')
     # parser.add_argument('--pretrain_checkpoint', type=str, default='value_function_fusion-model.pkl')
 
 
@@ -768,6 +783,7 @@ if __name__ == '__main__':
     optimizer = optim.Adam(fusion_model.parameters(), lr=args.lr)
 
     best_metric = float('inf')
+    history = []
     for epoch in range(args.n_epochs):
         fusion_model.train()
         running_loss = 0.0
@@ -793,9 +809,18 @@ if __name__ == '__main__':
 
         epoch_loss = running_loss / seen_samples
         epoch_mae = running_mae / seen_samples
+        epoch_record = {
+            'epoch': epoch + 1,
+            'train_loss': epoch_loss,
+            'train_mae': epoch_mae,
+            'val_loss': None,
+            'val_mae': None
+        }
 
         if val_dataloader is not None:
             val_loss, val_mae = evaluate_model(fusion_model, val_dataloader, criterion, device)
+            epoch_record['val_loss'] = val_loss
+            epoch_record['val_mae'] = val_mae
             log_message(
                 f"\nEpoch [{epoch + 1}/{args.n_epochs}], "
                 f"Train Loss: {epoch_loss:.4f}, Train MAE: {epoch_mae:.4f}, "
@@ -811,6 +836,8 @@ if __name__ == '__main__':
             )
             current_metric = epoch_loss
 
+        history.append(epoch_record)
+
         if current_metric < best_metric:
             best_metric = current_metric
             torch.save(fusion_model.state_dict(), FUSION_CHECKPOINT_PATH)
@@ -818,6 +845,11 @@ if __name__ == '__main__':
                 log_message(f"Best model saved with validation loss: {best_metric:.4f}", log_file)
             else:
                 log_message(f"Best model saved with training loss: {best_metric:.4f}", log_file)
+
+    curve_path = _resolve_curve_path(args.log_file, args.curve_path)
+    if curve_path and history:
+        save_training_curves_png(history, curve_path, title='Fusion Model Training Curves')
+        log_message(f"Training curves saved to: {curve_path}", log_file)
 
     if log_file is not None:
         log_file.close()
