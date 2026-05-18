@@ -673,14 +673,21 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--weight_decay', type=float, default=0.0)
     parser.add_argument('--val_ratio', type=float, default=0.1)
     parser.add_argument('--val_seed', type=int, default=42)
+    parser.add_argument('--min_epochs', type=int, default=0,
+                        help='Minimum epochs before early stopping can trigger.')
+    parser.add_argument('--early_stop_patience', type=int, default=0,
+                        help='Stop after this many non-improving epochs. 0 disables early stopping.')
     parser.add_argument('--build_cache_only', action='store_true')
     parser.add_argument('--cache_path', type=str, default=DEFAULT_CACHE_PATH)
     parser.add_argument('--overwrite_cache', action='store_true')
     parser.add_argument('--log_file', type=str, default=None)
     parser.add_argument('--curve_path', type=str, default=None,
                         help='Optional PNG path for training curves. Defaults next to --log_file.')
+    parser.add_argument('--save_path', type=str, default=FUSION_CHECKPOINT_PATH,
+                        help='Checkpoint path for the best model of this run.')
     # parser.add_argument('--pretrain_checkpoint', type=str, default='value_function_fusion-model.pkl')
 
 
@@ -690,6 +697,7 @@ if __name__ == '__main__':
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     cache_path = os.path.abspath(args.cache_path)
+    save_path = os.path.abspath(args.save_path)
     log_file = open_log_file(args.log_file)
     dataset_path = os.path.join(BASE_DIR, "data", "fusion-model_traindataset.json")
     scibert_dir = os.path.join(BASE_DIR, 'model', 'scibert')
@@ -740,6 +748,10 @@ if __name__ == '__main__':
             f"Run `python Fusion_model.py --build_cache_only` first."
         )
 
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
     cache_payload = torch.load(cache_path, map_location='cpu')
     validate_cache_payload(
         cache_payload,
@@ -771,18 +783,22 @@ if __name__ == '__main__':
         (
             f"Hyperparameters: batch_size={args.batch_size}, n_epochs={args.n_epochs}, "
             f"lr={args.lr}, dropout={args.dropout}, latent_dim={args.latent_dim}, "
-            f"n_layers={args.n_layers}, seed={args.seed}"
+            f"n_layers={args.n_layers}, weight_decay={args.weight_decay}, "
+            f"min_epochs={args.min_epochs}, early_stop_patience={args.early_stop_patience}, seed={args.seed}"
         ),
         log_file
     )
+    log_message(f"Checkpoint save path: {save_path}", log_file)
 
     fusion_model = FusionModel(600, 768, 600, args.n_layers, args.latent_dim, args.dropout)
     # fusion_model.load_state_dict(torch.load(args.pretrain_checkpoint))
     fusion_model.to(device)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(fusion_model.parameters(), lr=args.lr)
+    optimizer = optim.Adam(fusion_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_metric = float('inf')
+    best_epoch = 0
+    epochs_without_improvement = 0
     history = []
     for epoch in range(args.n_epochs):
         fusion_model.train()
@@ -840,11 +856,36 @@ if __name__ == '__main__':
 
         if current_metric < best_metric:
             best_metric = current_metric
-            torch.save(fusion_model.state_dict(), FUSION_CHECKPOINT_PATH)
+            best_epoch = epoch + 1
+            epochs_without_improvement = 0
+            torch.save(fusion_model.state_dict(), save_path)
             if val_dataloader is not None:
-                log_message(f"Best model saved with validation loss: {best_metric:.4f}", log_file)
+                log_message(
+                    f"Best model saved with validation loss: {best_metric:.4f} at epoch {best_epoch}",
+                    log_file
+                )
             else:
-                log_message(f"Best model saved with training loss: {best_metric:.4f}", log_file)
+                log_message(
+                    f"Best model saved with training loss: {best_metric:.4f} at epoch {best_epoch}",
+                    log_file
+                )
+        else:
+            epochs_without_improvement += 1
+
+        if (
+            args.early_stop_patience > 0
+            and (epoch + 1) >= max(1, args.min_epochs)
+            and epochs_without_improvement >= args.early_stop_patience
+        ):
+            log_message(
+                f"Early stopping triggered at epoch {epoch + 1}. Best epoch: {best_epoch}, best metric: {best_metric:.4f}",
+                log_file
+            )
+            break
+
+    if best_epoch > 0:
+        metric_name = 'validation loss' if val_dataloader is not None else 'training loss'
+        log_message(f"Run summary: best {metric_name} = {best_metric:.4f} at epoch {best_epoch}", log_file)
 
     curve_path = _resolve_curve_path(args.log_file, args.curve_path)
     if curve_path and history:
